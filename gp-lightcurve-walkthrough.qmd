@@ -1,0 +1,449 @@
+---
+title: "New metrics for identifying variables and transients in large astronomical surveys"
+author: "Shih Ching Fu (<shihching.fu@postgrad.curtin.edu.au>)"
+date: "November 2024"
+execute: 
+  echo: true
+  warning: false
+format: 
+  html:
+    toc: true
+self-contained: true
+number-sections: true
+---
+
+This notebook accompanies "New metrics for identifying variables and transients in large astronomical surveys" (Fu et al. 2024).
+
+```{r setup}
+#| message: false
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(astsa)
+library(scales)
+library(here)
+
+register_knitr_engine(override = FALSE)
+
+RANDOM_SEED <- 0
+N_CHAINS <- 4
+LENGTH_BURNIN <- 2000
+LENGTH_CHAIN <- 2000
+LENGTH_TSTAR <- 300
+N_PSD_SAMPLES <- 400
+
+theme_set(theme_bw())
+
+hyperparam_names <- c(
+  "sigma_SE", "sigma_M32", "sigma_P",
+  "ell_SE", "ell_M32", "ell_P",
+  "T"
+)
+```
+
+# Data
+
+This analysis assumes that each light curve comprises flux density measurements (`flux_density_Jy`), and an estimate of the standard error in those flux density measurements (`flux_density_se_Jy`) at each time point (`time_MJD`).
+
+The data used in this notebook comes from a real light curve from the ThunderKAT survey and is structured accordingly.
+
+```{r}
+lc_df <- read.csv(file = here("data", "195_ra281.904_dec-2.033_J1848GTraPDB_andersson.csv"))
+str(lc_df)
+```
+
+For each light curve, its raw flux density measurements are first standardised by subtracting its sample mean and dividing by its sample standard deviation. Standard errors are also scaled by the sample standard deviation. Times are translated so that the first measurement is indexed at time zero. 
+
+Standardisation of flux densities makes it easier to specify priors that are applicable across light curves of differing brightness; it also helps to improve numerical stability during parameter estimation. Setting times to start at zero improves the human readability of results. None of these transformations negatively affects model fitting and are easily reversed when visualising the resultant fit.
+
+```{r}
+# Values used for standardisation
+mean_flux_density <- mean(lc_df$flux_density_Jy, na.rm = TRUE)
+sd_flux_density <- stats::sd(lc_df$flux_density_Jy, na.rm = TRUE)
+start_MJD <- min(lc_df$time_MJD, na.rm = TRUE)
+
+# Offset times and standardise flux densities
+lc_df <- lc_df |>
+  mutate(
+    t = time_MJD - start_MJD,
+    f = (flux_density_Jy - mean_flux_density) / sd_flux_density,
+    f_se = flux_density_se_Jy / sd_flux_density
+  ) |>
+  arrange(t)
+
+head(lc_df)
+```
+
+Plotting the standardised light curve shows some moderate variability and fairly uniform standard errors across all the observations. The data sampling rate (cadence) is also quite uniform with no regions of high density or presence of wide gaps.
+
+```{r}
+lc_plot <- ggplot(lc_df, aes(x = t, y = f)) +
+  geom_point(colour = "blue") +
+  geom_linerange(aes(ymax = f + f_se, ymin = f - f_se), colour = "black") +
+  labs(x = "Time (days)", y = "Standardised Flux Density")
+
+lc_plot +
+  geom_text(aes(label = row_number(lc_df)), 
+            nudge_x = -5, colour = "blue", alpha = 0.7, size = 3
+  )
+```
+
+Observations number 13, 17, and 21, could be considered outliers given both their magnitudes and standard errors but will be retained in this analysis for now.
+
+
+# Model
+
+We assume that the flux density, $Y_i$ at time $t_i$ , $i = 1, \dots, N$, is Gaussian distributed about a latent mean, $f_i$, with variance $\sigma_i^2$. The time increments between $t_i$ and $t_{i+1}$ are not necessarily uniform.
+
+$$Y_i \sim \mathcal{N}(f(t_i), \sigma_i^2) \qquad i = 1, \dots, N.$$
+
+The latent flux density, $f$, is described by a Gaussian process with a zero mean function, and kernel function $\kappa$.
+
+$$f \sim \mathcal{GP}(\boldsymbol{0}, \kappa(t,  t'))$$
+
+The square-root of the variance, $\sigma_i$, is assumed to be equal to the observed standard error, $\hat{e}_i$, of the corresponding observation, $y_i$.
+
+$$\sigma_i = \hat{e}_i$$
+
+The kernel function is the sum of three constituent kernel functions, namely Squared Exponential (SE), Matern 3/2 (M32), and Periodic (P). These have been chosen in anticipation of the kinds of patterns we expect to observe in the radio light curve, namely smoothly varying trends, higher frequency fluctuations, and periodic oscillations.
+
+$$\kappa(t,t') = \sigma^2_\textrm{SE} \exp\left\{ -\frac{1}{2}\frac{(t - t')^2}{\ell_\mathrm{SE}^2}\right\} +  \sigma^2_\textrm{M32} \left( 1 + \frac{\sqrt{3}|t - t'|}{\ell_\textrm{M32}}\right)\exp\left\{ - \frac{\sqrt{3}|t - t'|}{\ell_\textrm{M32}}\right\} + \sigma^2_\textrm{P}\exp\left\{ -\frac{2 \sin^2\left( \pi\frac{|t - t'|}{T}\right)}{\ell_\mathrm{P}^2}\right\}$$
+
+The SE kernel is suited to capturing smooth variability, whilst the M32 kernel is suited to more jagged patterns. The Periodic kernel should converge upon any cyclic patterns.
+
+## Hyperpriors
+
+The hyperprior for all three of the the amplitude (marginal variance) hyperparameters $\sigma_\cdot$ is the standard Half-Normal distribution.
+
+$$\sigma_\textrm{SE}, \sigma_\textrm{M32}, \sigma_\textrm{P} \sim \mathcal{N}^+(0,1)$$
+
+As mentioned earlier, working with standardised measurements ensures the scale of the hyperprior matches that of the (standardised) data. 
+
+The hyperprior for all the length scale hyperparameters, $\ell_\cdot$, is an Inverse Gamma distribution, whose rate parameter is set to half of the total duration of the light curve. The Inverse Gamma distribution has very little weight towards zero which discourages fitting a Gaussian process with very short (degenerate) length scales.
+
+$$\ell_\textrm{SE}, \ell_\textrm{M32}, \ell_\textrm{P} \sim \mathrm{InvGamma}\left(3, \frac{1}{2} \times \lceil\textrm{range}(t)\rceil\right)$$
+
+The hyperprior for the period hyperparameter, $T$, is the continuous Uniform distribution. The lower bound is the Nyquist rate given the sampling of the light curve, and the upper bound is half of the total duration of the light curve. This latter bound implies that at least two cycles must be observed as sufficient evidence of periodicity. Keeping above the Nyquist rate avoids any aliasing effects.
+
+$$T \sim \mathcal{U}\left[2 \times \textrm{min}(\Delta t), \frac{1}{2} \times \textrm{range}(t)\right]$$
+
+Some further constraints are put on the length scale hyperparameters to prevent converging onto degenerate values. In particular, it is unreasonable to fit at resolutions shorter than the smallest gap between observations which puts a lower bound on the length scale hyperparameters.
+
+$$\ell_\textrm{M32} > \textrm{min}(\Delta t), \quad \ell_\textrm{P} > \textrm{min}(\Delta t)$$
+Lastly, constraining the length scale of the SE kernel to be greater than the M32 kernel ensures that former will favour fitting longer term trends than the latter. This helps mitigate any potential identifiability issues with the M32 kernel.
+
+$$\ell_\textrm{SE} > \ell_\textrm{M32}$$
+
+# Stan Implementation
+
+A "marginal" implementation is used for the `stan` model where the latent $f$ function is integrated out. This is possible because of the assumption of Gaussianity. It also possible to get an analytic expression for the posterior predictive distribution which makes generating posterior predictive sample (curves) more efficient.
+
+```{r}
+readLines(here("marginal_model.stan"))
+```
+
+```{r}
+marginal_stanmodel <- cmdstan_model(here("marginal_model.stan"))
+```
+
+Fit the GP model, passing in summary statistics of the observations for use in the hyperparameter priors.
+
+By default, `stan` uses the No U-turn sampler (NUTS) to conduct parameter estimation. Here we are using four MCMC chains of 2000 samples each, with a burn-in of 2000 samples per chain. 
+
+```{r}
+N_t <- length(lc_df$t) # size of light curve
+min_t <- min(lc_df$t, na.rm = TRUE) # starting time point
+max_t <- max(lc_df$t, na.rm = TRUE) # ending time point
+mingap_t <- min(diff(sort(lc_df$t)), na.rm = TRUE) # shortest time increment
+range_t <- max_t - min_t # duration of light curve
+
+# Time points for posterior predictive samples
+t_star <- seq(from = min_t, to = max_t, length.out = LENGTH_TSTAR)
+N_tstar <- length(t_star)
+
+data_list <- list(
+  N = N_t,
+  x = lc_df$t,
+  y = lc_df$f,
+  y_stderr = lc_df$f_se,
+  x_star = t_star,
+  N_star = N_tstar,
+  x_mingap = mingap_t,
+  x_range = range_t,
+  T_upper = range_t / 2, # Bounds used for prior on T
+  T_lower = mingap_t * 2
+)
+
+output <- marginal_stanmodel$sample(
+  data = data_list,
+  seed = RANDOM_SEED,
+  chains = N_CHAINS,
+  parallel_chains = N_CHAINS,
+  iter_warmup = LENGTH_BURNIN,
+  iter_sampling = LENGTH_CHAIN,
+  refresh = 0,
+  show_exceptions = FALSE
+)
+```
+
+## Prior Predictive Checks
+
+Prior predictive can confirm whether the choice of priors will result in curves that are plausibly generated by the same stochastic process as the observed data. There does not need to be exact correspondence between the simulated curves and the data since unlike _posterior_ predictive curves, the prior predictive samples do not incorporate the observed data.
+
+```{r}
+set.seed(0)
+prior_pred_samples <- output$draws(variables = "f_prior", format = "df") |> 
+  as.data.frame() |> 
+  select(sample = .iteration, starts_with("f_prior")) |> 
+  slice_sample(n = 200) |> 
+  pivot_longer(starts_with("f_prior"), 
+               names_to = "index", 
+               names_pattern = "([0-9]+)") |> 
+  cbind(t = lc_df$t)
+
+lc_plot +
+  geom_line(
+    mapping = aes(x = t, y = value, group = sample),  
+    data = prior_pred_samples,
+    colour = "red", alpha = 0.1)
+```
+
+From the 200 prior predictive samples, we see that the curves cover the range of the data quite well.
+
+## MCMC Diagnostics
+
+In general, MCMC procedures will always converge onto a solution but no guarantees are made on how many iterations it takes to do so.
+
+Two popular numerical measures of chain performance are $\hat{r}$ and effective sample size (ESS). The former is a convergence diagnostic and the latter a measure of chain efficiency. An $\hat{r} \gt 1.05$ typically indicates a problem and that chains have not mixed well. The "bulk" ESS measures sampling efficiency in the centre of the distribution, such around the mean, and the "tail" ESS reflects the efficiency in the tails of the distribution. 
+
+```{r}
+output$summary(
+  variables = hyperparam_names,
+  rhat = posterior::rhat,
+  ess_bulk,
+  ess_tail
+)
+```
+
+In this instance, $\hat{r}$ is close to 1.0 and the ESS are of similar order to the number of samples. This indicates good MCMC performance.
+
+Inspecting the MCMC trace can also help establish whether the MCMC procedure adequately explored the parameter space and has properly converged.
+
+```{r}
+mcmc_trace(output$draws(variables = hyperparam_names))
+```
+
+Here we observed the desire "fuzzy caterpillar" pattern that indicates that the four independent chains are well mixed and have reached a stationary distribution.
+
+# Results
+
+## Hyperparameter Posteriors
+
+```{r}
+# Function estimates the mode of a sample
+estimate_mode <- function(x) {
+  d <- density(x)
+  d$x[which.max(d$y)]
+}
+
+posterior_summary <- output$summary(
+  variables = hyperparam_names,
+  mean,
+  sd = posterior::sd,
+  median,
+  quantiles = ~ quantile2(., probs = c(0.16, 0.84)),
+  mode = ~ estimate_mode(.)
+)
+
+posterior_summary
+```
+
+```{r}
+plot_prior_posterior_histogram <- function(fit_object, variable) {
+  var_names <- c(variable, paste0(variable, "_sim"))
+  fit_object$draws(variables = var_names, format = "df") |> 
+  pivot_longer(cols = var_names) |> 
+  ggplot() +
+  aes(x = value, fill = name) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 40) +
+  labs(y = "Count", fill = "") +
+  scale_fill_discrete(labels = c("Posterior", "Prior")) +
+  theme(legend.location = "inside")
+}
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "sigma_SE") +
+  labs(x = expression(sigma[SE])) 
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "sigma_M32") +
+  labs(x = expression(sigma[M32])) 
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "sigma_P") +
+  labs(x = expression(sigma[P])) +
+  scale_x_log10()
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "ell_SE") +
+  labs(x = expression("\u2113"[SE])) + 
+  scale_x_log10()
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "ell_M32") +
+  labs(x = expression("\u2113"[M32])) + 
+  scale_x_log10()
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "ell_P") +
+  labs(x = expression("\u2113"[P])) + 
+  scale_x_log10()
+```
+
+```{r}
+plot_prior_posterior_histogram(output, "T") +
+  labs(x = expression(T)) +
+  scale_x_log10()
+```
+
+```{r}
+#| fig-asp: 1
+mcmc_pairs(output$draws(variables = hyperparam_names), 
+           off_diag_fun = "hex")
+```
+
+## Posterior Predictive Samples
+
+```{r}
+f_stars <- as_draws_rvars(output$draws(variables = "f_star"))$f_star
+f_star_quantiles <- data.frame(
+  t_star,
+  t(quantile2(f_stars, probs = c(0.05, 0.16, 0.5, 0.84, 0.95), na.rm = TRUE))
+)
+
+ggplot(f_star_quantiles) +
+  aes(x = t_star) +
+  geom_ribbon(
+    aes(ymin = q16, ymax = q84),
+    fill = "red", alpha = 0.3,
+  ) +
+  geom_ribbon(
+    aes(ymin = q5, ymax = q95),
+    fill = "red", alpha = 0.3,
+  ) +
+  geom_line(
+    aes(y = q50, colour = "Median")
+  ) +
+  geom_linerange(
+    data = lc_df,
+    aes(x = t, ymax = f + f_se, ymin = f - f_se, colour = "Std. Err.")
+  ) +
+  geom_point(
+    data = lc_df,
+    aes(x = t, y = f, colour = "Data")
+  ) +
+  scale_colour_manual(values = c(
+    "Data" = "blue",
+    "Std. Err." = "black",
+    "Median" = "red"
+  )) +
+  labs(x = "Time (days)", y = "Standardised Flux Density", colour = "")
+```
+
+## Kernel Components
+
+```{r}
+f_stars_tidy <- data.frame(
+  Time = t_star,
+  All = colMeans(output$draws("f_star", format = "draws_matrix"), na.rm = TRUE),
+  SE = colMeans(output$draws("f_star_SE", format = "draws_matrix"), na.rm = TRUE),
+  M32 = colMeans(output$draws("f_star_M32", format = "draws_matrix"), na.rm = TRUE),
+  P = colMeans(output$draws("f_star_P", format = "draws_matrix"), na.rm = TRUE)
+) |> 
+  pivot_longer(-Time, names_to = "component", values_to = "flux_density_std") 
+
+f_stars_tidy |> 
+  ggplot() +
+  aes(x = Time, y = flux_density_std, colour = component) +
+  geom_line(linewidth = 1) + 
+  facet_wrap(vars(component), ncol = 1, strip.position = "right") +
+  theme(legend.position = "none") +
+  labs(x = "Time (days)", y = "Std. Flux density", colour = "Component") +
+  scale_y_continuous(labels = label_number())
+```
+
+## Power Spectral Density (PSD)
+
+```{r}
+#| message: false
+
+set.seed(RANDOM_SEED)
+for (ii in c("f_star", "f_star_SE", "f_star_M32", "f_star_P")) {
+  spec <- mvspec(
+    t(subset_draws(output$draws(variables = ii, format = "matrix"), 
+                   draw = 1:N_PSD_SAMPLES)),
+    plot = FALSE
+  )
+  if (ii == "f_star") {
+    psds_df <- data.frame(frequency = spec$freq)
+  }
+  psds_df[, paste0(ii, "_power")] <- spec$spec
+}
+
+psds_df |>
+  rowwise() |>
+  mutate(
+    q0.05 = quantile(c_across(starts_with("f_star_power")), probs = 0.05),
+    q0.16 = quantile(c_across(starts_with("f_star_power")), probs = 0.16),
+    median = median(c_across(starts_with("f_star_power"))),
+    q0.84 = quantile(c_across(starts_with("f_star_power")), probs = 0.84),
+    q0.95 = quantile(c_across(starts_with("f_star_power")), probs = 0.95),
+    SE_median = median(c_across(starts_with("f_star_SE_power"))),
+    M32_median = median(c_across(starts_with("f_star_M32_power"))),
+    P_median = median(c_across(starts_with("f_star_P_power")))
+  ) |>
+  ggplot() +
+  aes(x = frequency, y = median) +
+  geom_ribbon(aes(ymin = q0.16, ymax = q0.84), fill = "blue", alpha = 0.3) +
+  geom_ribbon(aes(ymin = q0.05, ymax = q0.95), fill = "blue", alpha = 0.3) +
+  geom_line(linewidth = 1.5, colour = "blue") +
+  geom_line(aes(y = SE_median, colour = "SE")) +
+  geom_line(aes(y = M32_median, colour = "Matern 3/2")) +
+  geom_line(aes(y = P_median, colour = "Periodic")) +
+  scale_x_log10() +
+  scale_y_log10(labels = label_log()) +
+  labs(x = "Frequency", y = "Spectral Density", colour = "Kernel") +
+  scale_colour_manual(values = c(
+    "SE" = "darkgreen",
+    "Matern 3/2" = "brown",
+    "Periodic" = "darkorange"
+  ))
+```
+
+```{r}
+thunderKAT_sigma_posterior_medians <- read.csv(here("data","sigma_medians.csv"))
+
+ggplot(thunderKAT_sigma_posterior_medians) +
+  aes(x = sigma_M32, y = sigma_SE) +
+  geom_point(alpha = 0.1, size = 2) +
+  annotate("point",
+           x = posterior_summary$median[2],
+           y = posterior_summary$median[1],
+           colour = "magenta",
+           size = 3) +
+  labs(
+    x = expression("\u03c3"[M32]),
+    y = expression("\u03c3"[SE])
+  )
+```
+
