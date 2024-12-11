@@ -63,7 +63,7 @@ data {
   real x_mingap;
   real x_range;
   real T_lower;
-  //real T_upper;
+  real T_upper;
 }
 transformed data {
   vector[N] mu = rep_vector(0, N); // Zero mean function
@@ -76,7 +76,7 @@ parameters {
   real<lower=x_mingap> ell_M32;
   real<lower=ell_M32> ell_SE;
   real<lower=x_mingap> ell_P;
-  real<lower=T_lower,upper=ell_P> T;
+  real<lower=T_lower,upper=T_upper> T;
 }
 model {
   matrix[N, N] K = gp_exp_quad_cov(x, sigma_SE, ell_SE) +
