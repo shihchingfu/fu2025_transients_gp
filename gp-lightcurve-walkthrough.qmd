@@ -1,7 +1,7 @@
 ---
 title: "New metrics for identifying variables and transients in large astronomical surveys"
 author: "Shih Ching Fu (<shihching.fu@postgrad.curtin.edu.au>)"
-date: "November 2024"
+date: "December 2024"
 execute: 
   echo: true
   warning: false
@@ -12,7 +12,7 @@ self-contained: true
 number-sections: true
 ---
 
-This notebook accompanies "New metrics for identifying variables and transients in large astronomical surveys" (Fu et al. 2024).
+This notebook accompanies "New metrics for identifying variables and transients in large astronomical surveys".
 
 ```{r setup}
 #| message: false
@@ -316,10 +316,13 @@ plot_prior_posterior_histogram(output, "T") +
   scale_x_log10()
 ```
 
+Comparison of hyperpriors to hyperposteriors shows that the squared exponential and Matern 3/2 amplitude hyperparameters, and the Matern 3/2 length scale hyperparameters were strongly influenced by the observed data. Conversely, the other hyperparameters largely returned the hyperprior.
+
+The one exception is the period hyperparameter where it is clear that the posterior samples are piled up against the the upper bound of the uniform hyperprior.
+
 ```{r}
 #| fig-asp: 1
-mcmc_pairs(output$draws(variables = hyperparam_names), 
-           off_diag_fun = "hex")
+mcmc_pairs(output$draws(variables = hyperparam_names), off_diag_fun = "hex")
 ```
 
 ## Posterior Predictive Samples
@@ -360,6 +363,8 @@ ggplot(f_star_quantiles) +
   labs(x = "Time (days)", y = "Standardised Flux Density", colour = "")
 ```
 
+The posterior predictive samples, conditioned on the observed data, shows a reasonable fit to the observed data.
+
 ## Kernel Components
 
 ```{r}
@@ -381,6 +386,8 @@ f_stars_tidy |>
   labs(x = "Time (days)", y = "Std. Flux density", colour = "Component") +
   scale_y_continuous(labels = label_number())
 ```
+
+A comparative plot of kernel contributions shows that most of the variability in the light curve can be described by the Matern 3/2 kernel term. The squared exponential kernel term, being constrained to longer length scales, has captured smoother trends, while the periodic kernel has a negligible response.
 
 ## Power Spectral Density (PSD)
 
@@ -422,13 +429,15 @@ psds_df |>
   geom_line(aes(y = P_median, colour = "Periodic")) +
   scale_x_log10() +
   scale_y_log10(labels = label_log()) +
-  labs(x = "Frequency", y = "Spectral Density", colour = "Kernel") +
+  labs(x = expression(Frequency~(day^-1)), y = "Spectral Density", colour = "Kernel") +
   scale_colour_manual(values = c(
     "SE" = "darkgreen",
     "Matern 3/2" = "brown",
     "Periodic" = "darkorange"
   ))
 ```
+
+The component-wise plot of the PSD confirms that the Matern 3/2 dominates the model fit and that no periodicity appears to be present.
 
 ```{r}
 thunderKAT_sigma_posterior_medians <- read.csv(here("data","sigma_medians.csv"))
@@ -447,3 +456,4 @@ ggplot(thunderKAT_sigma_posterior_medians) +
   )
 ```
 
+The location of this light curve in the amplitude hyperparameter space shows that this light curve is a potential transient or variable candidate.
