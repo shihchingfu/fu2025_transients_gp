@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: >-
+  Computational notebooks accompanying "New metrics for
+  identifying variables and transients in large astronomical
+  surveys"
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Shih Ching
+    family-names: Fu
+    email: shihching.fu@postgrad.curtin.edu.au
+    orcid: 'https://orcid.org/0000-0002-9077-6026'
+repository-code: 'https://github.com/shihchingfu/fu2025_transients_gp'
+license: MIT
